@@ -38,7 +38,7 @@ l'auteur ; elle ne change rien aux licences des composants de tiers listés plus
 ## Code source correspondant
 
 - Sources du moteur, scripts de construction et tests :
-  **https://github.com/romainscheyvaerts-svg/NOVA-STUDIO-DAW-0901-/tree/main/native-audio**
+  **https://github.com/romainscheyvaerts-svg/nova-audio-engine**
   (version exacte de l'exécutable installé : voir `SOURCE.txt` à côté de ce fichier, qui donne le
   commit Git d'où il a été construit).
 - Fichiers partagés avec d'autres outils de Nova Studio et compilés dans le moteur, distribués dans
