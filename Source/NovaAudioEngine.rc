@@ -1,0 +1,31 @@
+// NovaAudioEngine - Copyright (C) 2026 Make Music. SPDX-License-Identifier: GPL-3.0-only (native-audio/LICENSE)
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040c04b0"
+        BEGIN
+            VALUE "CompanyName", "Make Music"
+            VALUE "FileDescription", "Nova Studio - moteur audio natif"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "NovaAudioEngine"
+            VALUE "OriginalFilename", "NovaAudioEngine.exe"
+            VALUE "ProductName", "Nova Studio"
+            VALUE "ProductVersion", "0.1.0"
+            VALUE "LegalCopyright", "(C) 2026 Make Music - GPLv3 (voir LICENCES.md). VST3 SDK (MIT) et ASIO SDK (GPLv3) Steinberg"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x40c, 1200
+    END
+END

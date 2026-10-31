@@ -1,0 +1,4 @@
+LIBRARY NovaFakeAsio
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
