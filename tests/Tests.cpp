@@ -10,7 +10,9 @@
     Variable NOVA_TEST_VST3=<chemin .vst3> : ajoute le test « retour casque avec un vrai VST3 ».
 
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -21,7 +23,11 @@
 #include "Engine.h"
 #include "Resampler.h"
 #include "WavFile.h"
+#if NOVA_AUDIO_WITH_NOVATUNE
+ #include "NovaTune.h"   // édition pro seulement (propriétaire)
+#endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -557,7 +563,228 @@ namespace
         }
         return o;
     }
+
+#if NOVA_AUDIO_WITH_NOVATUNE
+    //==========================================================================
+    // Nova Tune natif (insert « novatune », NovaTune.h). La comparaison avec la version web est
+    // faite par le banc tests/novaTuneNatif.test.ts (NovaTuneBench.exe) ; ici, les garanties propres
+    // au moteur : retard exact, bypass au bit près, tranches de 128, latence au casque, réglage en direct.
+    std::vector<float> runTune (const std::vector<float>& x, int block, const char* params, double sr = 48000)
+    {
+        NovaTune t (sr);
+        t.setParams (Value::parse (params));
+        std::vector<float> y (x.size());
+        for (size_t s0 = 0; s0 < x.size(); s0 += (size_t) block)
+        {
+            const int n = (int) std::min ((size_t) block, x.size() - s0);
+            const float* ip[1] = { x.data() + s0 };
+            float* op[1] = { y.data() + s0 };
+            t.process (ip, op, 1, n);
+        }
+        return y;
+    }
+
+    /** Fréquence moyenne (Hz) par passages à zéro interpolés sur [a, b[. */
+    double zcFreq (const std::vector<float>& y, size_t a, size_t b, double sr)
+    {
+        double first = -1, last = -1;
+        int n = 0;
+        for (size_t i = a + 1; i < b; ++i)
+            if (y[i - 1] < 0 && y[i] >= 0)
+            {
+                const double t = (double) (i - 1) + y[i - 1] / (double) (y[i - 1] - y[i]);
+                if (first < 0) first = t;
+                last = t;
+                ++n;
+            }
+        return n > 1 ? (n - 1) * sr / (last - first) : 0;
+    }
+
+    Value testNovaTune()
+    {
+        const double sr = 48000;
+        std::vector<float> x (96000);
+        // Voix tenue simplifiée : 445 Hz (≈ +19,6 cents au-dessus du La 440), 3 harmoniques.
+        for (size_t i = 0; i < x.size(); ++i)
+        {
+            const double ph = 2 * 3.141592653589793 * 445.0 * (double) i / sr;
+            x[i] = (float) (0.25 * std::sin (ph) + 0.08 * std::sin (2 * ph) + 0.04 * std::sin (3 * ph));
+        }
+        auto o = Value::object();
+        const int dmin = (int) std::floor (0.0005 * sr + 0.5) + 4;
+
+        // 1. Dosage 0, mode direct : sortie = entrée retardée de llDmin (0,5 ms + 4 images), au bit près.
+        auto y0 = runTune (x, 128, R"({"mix":0,"speed":0,"lowLatency":true})");
+        size_t bad = 0;
+        for (size_t i = (size_t) dmin; i < x.size(); ++i) if (y0[i] != x[i - (size_t) dmin]) ++bad;
+        check (bad == 0, "Nova Tune : dosage 0 en mode direct = entrée retardée de " + std::to_string (dmin) + " images, au bit près (" + std::to_string (bad) + " écarts)");
+        o.set ("direct_retard_images", dmin);
+
+        // 2. Bypass : sortie = entrée au bit près.
+        auto yb = runTune (x, 128, R"({"isEnabled":false})");
+        check (yb == x, "Nova Tune : désactivé = entrée au bit près");
+
+        // 3. Correction : 445 Hz ramené à 440 Hz (robot, chromatique), dans les deux modes.
+        for (const bool ll : { true, false })
+        {
+            auto y = runTune (x, 128, ll ? R"({"speed":0,"humanize":0,"lowLatency":true})" : R"({"speed":0,"humanize":0,"lowLatency":false})");
+            const double f = zcFreq (y, 48000, 96000, sr);
+            const double cents = 1200 * std::log2 (f / 440.0);
+            o.set (ll ? "direct_cents_vs_la440" : "qualite_cents_vs_la440", cents);
+            check (std::fabs (cents) < 3, std::string ("Nova Tune : 445 Hz corrigé à 440 Hz ±3 cents (") + (ll ? "direct" : "qualité") + ") : " + std::to_string (cents));
+        }
+
+        // 4. Tranches de 128 alignées : un tampon de 256 ou 512 donne le MÊME son qu'un tampon de 128 (au bit près).
+        //    Avec 64 ou 96, les tranches sont plus courtes (sans retard ajouté) : la hauteur visée arrive à
+        //    quelques dizaines d'images près, les raccords tombent ailleurs ; même hauteur à ±0,5 cent.
+        const char* robot = R"({"speed":0,"humanize":0,"lowLatency":true,"scale":"MINOR","rootKey":9})";
+        auto r128 = runTune (x, 128, robot), r256 = runTune (x, 256, robot), r512 = runTune (x, 512, robot);
+        check (r256 == r128 && r512 == r128, "Nova Tune : tampon 256 / 512 = tampon 128 au bit près (tranches alignées)");
+        const double f128 = zcFreq (r128, 48000, 96000, sr);
+        for (const int blk : { 32, 64, 96 })
+        {
+            auto r = runTune (x, blk, robot);
+            const double dc = 1200 * std::log2 (zcFreq (r, 48000, 96000, sr) / f128);
+            o.set ("tampon" + std::to_string (blk) + "_vs_128_cents", dc);
+            check (std::fabs (dc) < 0.5, "Nova Tune : tampon " + std::to_string (blk) + " = même hauteur que 128 (±0,5 cent) : " + std::to_string (dc));
+        }
+        return o;
+    }
+
+    Value testNovaTuneChain()
+    {
+        // Boucle simulée (comme testLatencyLoopback) : Nova Tune en mode direct dans la chaîne du casque.
+        Engine e;
+        std::string err;
+        auto res = runEngine ("null?loopback=1&extra=48&speed=1", 48000, 128, 0, e, err);
+        check (res.isObject(), "Nova Tune natif : démarrage " + err);
+        if (! res.isObject()) return Value();
+        Value rep;
+        const bool built = e.setMonitorChain (Value::parse (R"({"strips":[{"id":"voix","inputs":[0],"gain_db":0,
+            "inserts":[{"type":"novatune","id":"novatune","params":{"speed":0,"scale":"MINOR","rootKey":9,"lowLatency":true}}],
+            "sends":[{"outs":[1],"gain":1}]}]})"), rep, err);
+        check (built, "Nova Tune natif : inséré dans la chaîne du retour " + err);
+        const int nominal = NovaTune::lowLatencyNominal (48000);
+        check (rep["latency"].asInt (-1) == nominal, "Nova Tune natif : latence annoncée du mode direct = " + std::to_string (nominal) + " images");
+        Sleep (200);
+        Value got;
+        HANDLE ev = CreateEventW (nullptr, TRUE, FALSE, nullptr);
+        e.measureLatency ({ 0 }, 0.3, 0.5f, [&] (Value v) { got = v; SetEvent (ev); }, err);
+        WaitForSingleObject (ev, 3000);
+        CloseHandle (ev);
+        const int rt = 2 * 128 + 48;
+        const int d0 = got["delays"].at (0).asInt (-1), d1 = got["delays"].at (1).asInt (-1);
+        const int dmin = (int) std::floor (0.0005 * 48000 + 0.5) + 4;
+        check (d0 == rt && d1 - d0 == rt + dmin, "Nova Tune natif : retour casque = aller-retour du pilote + " + std::to_string (dmin)
+               + " images (0,58 ms), aucun bloc ajouté (" + std::to_string (d1 - d0) + ")");
+        // Réglage en direct (monitor_params) : mode qualité, latence relue.
+        Value pr;
+        const bool ok = e.setMonitorParams (Value::parse (R"({"strip":"voix","insert":"novatune","params":{"lowLatency":false,"speed":0.5}})"), pr, err);
+        check (ok && pr["chain_latency"].asInt (-1) == NovaTune::qualityLatency (48000) && e.monitorLatency() == NovaTune::qualityLatency (48000),
+               "Nova Tune natif : monitor_params bascule en mode qualité, latence relue (" + std::to_string (e.monitorLatency()) + ") " + err);
+        check (std::fabs (pr["params"]["speed"].asDouble (-1) - 0.5) < 1e-6 && pr["params"]["scale"].asString() == "MINOR",
+               "Nova Tune natif : réglage modifié, les autres gardés");
+        Value bad;
+        std::string err2;
+        check (! e.setMonitorParams (Value::parse (R"({"strip":"autre","params":{}})"), bad, err2), "Nova Tune natif : tranche inconnue refusée");
+        Sleep (300);
+        auto st = e.stats();
+        e.stop();
+        auto o = Value::object();
+        o.set ("chain", rep);
+        o.set ("monitor_frames", d1 - d0);
+        o.set ("monitor_ms", 1000.0 * (d1 - d0) / 48000.0);
+        o.set ("added_by_novatune_ms", 1000.0 * (d1 - d0 - rt) / 48000.0);
+        o.set ("inserts", st["inserts"]);
+        o.set ("late_callbacks", st["late_callbacks"]);
+        check (st["late_callbacks"].asInt (1) == 0, "Nova Tune natif : aucun callback en retard");
+        return o;
+    }
+#endif
 }
+
+#if NOVA_AUDIO_WITH_ASIO
+namespace
+{
+    // Banc de stress du chemin ASIO existant, avec le pilote ASIO FACTICE (NovaFakeAsio.dll, même
+    // modèle physique que le faux WASAPI du mode pro : 2 périodes + 24 images de convertisseurs).
+    //   NovaAudioTests.exe asiobench   (NOVA_BENCH_SECONDS=600, NOVA_BENCH_BUFFER=64, NOVA_BENCH_STRESS=0.5,
+    //                                   NOVA_BENCH_OUT=<fichier.json>)
+    Value asioBench()
+    {
+        char buf[MAX_PATH] {};
+        auto env = [&] (const char* k, double def) { return GetEnvironmentVariableA (k, buf, MAX_PATH) > 0 ? std::atof (buf) : def; };
+        const double seconds = env ("NOVA_BENCH_SECONDS", 600);
+        const int buffer = (int) env ("NOVA_BENCH_BUFFER", 64);
+        const double stress = env ("NOVA_BENCH_STRESS", 0.5);
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW (nullptr, exe, MAX_PATH);
+        std::wstring dir (exe);
+        dir = dir.substr (0, dir.find_last_of (L"\\/"));
+        const auto rep = tempPath (L"fakeasio_bench.json");
+        const std::string fake = "inputs=2;outputs=2;buffer=" + std::to_string (buffer) + ";extra_in=12;extra_out=12;noise=none;speed=1;report=" + narrow (rep);
+        SetEnvironmentVariableA ("NOVA_FAKEASIO", fake.c_str());
+        EngineConfig c;
+        c.device = "asio-dll:" + narrow (dir) + "\\NovaFakeAsio.dll?clsid={A6B0C3E2-5D1F-4C7A-9E31-0F4E2B7D9C11}";
+        c.projectRate = 48000;
+        c.buffer = buffer;
+        c.shared = false;
+        c.captureSeconds = 4;
+        c.stress = stress;
+        Engine e;
+        Value res;
+        std::string err;
+        auto o = Value::object();
+        if (! e.start (c, res, err)) { o.set ("error", err); return o; }
+        Sleep (500);
+        int rt = -1;
+        {
+            HANDLE done = CreateEventW (nullptr, TRUE, FALSE, nullptr);
+            Value got;
+            std::string e2;
+            if (e.measureLatency ({ 0 }, 0.3, 0.5, [&] (Value v) { got = v; SetEvent (done); }, e2) && WaitForSingleObject (done, 5000) == WAIT_OBJECT_0)
+                rt = got["delays"].at (0).isNumber() ? got["delays"].at (0).asInt (-1) : -3;
+            CloseHandle (done);
+        }
+        auto cpuSec = [] { FILETIME a, b, k, u; GetProcessTimes (GetCurrentProcess(), &a, &b, &k, &u);
+                           auto s = [] (const FILETIME& f) { return (double) (((uint64_t) f.dwHighDateTime << 32) | f.dwLowDateTime) * 1e-7; };
+                           return s (k) + s (u); };
+        const double cpu0 = cpuSec(), t0 = nowMs();
+        const auto s0 = e.stats();
+        Sleep ((DWORD) (seconds * 1000));
+        const double cpu = 100.0 * (cpuSec() - cpu0) / ((nowMs() - t0) / 1000.0);
+        const auto st = e.stats();
+        e.stop();
+        o.set ("path", "asio (pilote ASIO factice)");
+        o.set ("seconds", seconds);
+        o.set ("buffer", buffer);
+        o.set ("stress", stress);
+        o.set ("announced_roundtrip_ms", res["roundtrip_ms"]);
+        o.set ("measured_roundtrip_frames", rt);
+        o.set ("measured_roundtrip_ms", 1000.0 * rt / 48000.0);
+        o.set ("xruns", st["device_xruns"].asDouble (0) - s0["device_xruns"].asDouble (0) + st["late_callbacks"].asDouble (0) - s0["late_callbacks"].asDouble (0));
+        o.set ("callback_avg_us", st["callback_avg_us"]);
+        o.set ("callback_max_us", st["callback_max_us"]);
+        o.set ("cpu_percent_one_core", cpu);
+        o.set ("path_overhead_avg_us", st["callback_avg_us"].asDouble (0) - stress * buffer * 1e6 / 48000.0);
+        if (FILE* f = _wfopen (rep.c_str(), L"rb"))
+        {
+            std::string t;
+            char b2[4096];
+            size_t n;
+            while ((n = std::fread (b2, 1, sizeof (b2), f)) > 0) t.append (b2, n);
+            std::fclose (f);
+            o.set ("fake_driver_report", Value::parse (t));
+        }
+        return o;
+    }
+}
+#endif
+
+#if NOVA_AUDIO_PRO
+// Tests du mode audio pro (tests/pro/ProTests.cpp, faux WASAPI : aucun vrai périphérique).
+void runProTests (const std::string& only, nova::json::Value& report, int& passes, int& failures);
+#endif
 
 int main (int argc, char** argv)
 {
@@ -574,6 +801,23 @@ int main (int argc, char** argv)
     if (only.empty() || only == "take_rs") report.set ("take_resampled", testEngineResampledTake());
     if (only.empty() || only == "latency") report.set ("latency_loopback", testLatencyLoopback());
     if (only.empty() || only == "chain") report.set ("chain_file", testFileMonitorChain());
+#if NOVA_AUDIO_WITH_NOVATUNE
+    if (only.empty() || only == "novatune") report.set ("novatune", testNovaTune());
+    if (only.empty() || only == "novatune") report.set ("novatune_chain", testNovaTuneChain());
+#endif
+#if NOVA_AUDIO_PRO
+    runProTests (only, report, passes, failures);
+#endif
+#if NOVA_AUDIO_WITH_ASIO
+    if (only == "asiobench")
+    {
+        const auto r = asioBench();
+        report.set ("asiobench", r);
+        char path[MAX_PATH] {};
+        if (GetEnvironmentVariableA ("NOVA_BENCH_OUT", path, MAX_PATH) > 0)
+            if (FILE* f = std::fopen (path, "wb")) { const auto t = r.dump(); std::fwrite (t.data(), 1, t.size(), f); std::fclose (f); }
+    }
+#endif
     char vst[MAX_PATH] {};
     if ((only.empty() || only == "vst3") && GetEnvironmentVariableA ("NOVA_TEST_VST3", vst, MAX_PATH) > 0)
         report.set ("vst3", testVst3Chain (vst));

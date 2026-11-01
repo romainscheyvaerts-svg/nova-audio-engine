@@ -1,7 +1,9 @@
 /*
     NovaAudioEngine — périphériques « nul » et « fichier », fabrique, outils temps réel.
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -73,11 +75,15 @@ namespace nova::audio
             s.type = head.substr (0, colon);
             s.name = head.substr (colon + 1);
         }
-        else if (head == "null" || head == "file" || head == "wasapi")
+        else if (head == "null" || head == "file" || head == "wasapi" || head == "pro")
             s.type = head;
         else
         {
+#if NOVA_AUDIO_PRO && ! NOVA_AUDIO_WITH_ASIO
+            s.type = "?";              // édition pro : pas de pilote tiers par son seul nom
+#else
             s.type = "asio";
+#endif
             s.name = head;
         }
         size_t i = 0;
@@ -438,15 +444,18 @@ namespace nova::audio
         if (s.type == "null") return createNullDevice (s);
         if (s.type == "file") return createFileDevice (s);
         if (s.type == "wasapi") return createWasapiDevice (s);
+#if NOVA_AUDIO_PRO
+        if (s.type == "pro") return createProDevice (s);
+#endif
+#if NOVA_AUDIO_WITH_ASIO
+        if (s.type == "asio" || s.type == "asio-dll") return createAsioDevice (s);
+#elif ! NOVA_AUDIO_PRO
         if (s.type == "asio" || s.type == "asio-dll")
         {
-#if NOVA_AUDIO_WITH_ASIO
-            return createAsioDevice (s);
-#else
             err = "ASIO non compilé dans ce moteur (build.bat asio)";
             return nullptr;
-#endif
         }
+#endif
         err = "périphérique inconnu : " + specText;
         return nullptr;
     }
@@ -457,11 +466,16 @@ namespace nova::audio
 #if NOVA_AUDIO_WITH_ASIO
         o.set ("asio", listAsioDrivers());
         o.set ("asio_available", true);
-#else
+#elif ! NOVA_AUDIO_PRO
         o.set ("asio", Value::array());
         o.set ("asio_available", false);
 #endif
         if (wasapi) o.set ("wasapi", listWasapiEndpoints());
+#if NOVA_AUDIO_PRO
+        // Mode audio pro Nova : sorties / entrées, noms des canaux, plus petite période.
+        if (wasapi) o.set ("pro", listProEndpoints());
+        o.set ("pro_available", true);
+#endif
         auto sim = Value::array();
         sim.push ("null");
         sim.push ("file");

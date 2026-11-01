@@ -14,7 +14,9 @@
     disque par le moteur lui-même (fichiers WAV).
 
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md

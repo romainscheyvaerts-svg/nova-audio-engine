@@ -1,7 +1,9 @@
 /*
     NovaAudioEngine — chaîne du retour casque (voir MonitorChain.h).
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -10,6 +12,25 @@
     particulier. Texte de la licence : native-audio/LICENSE (https://www.gnu.org/licenses/gpl-3.0.html).
 */
 #include "MonitorChain.h"
+#if NOVA_AUDIO_WITH_NOVATUNE
+ #include "NovaTune.h"
+#else
+namespace nova::audio
+{
+    // Nova Tune natif n'est livré que dans l'édition « Nova Pro Audio » (licence propriétaire de Make
+    // Music, native-audio/pro/). Ici : coquille jamais créée (l'insert « novatune » est refusé).
+    class NovaTune
+    {
+    public:
+        std::atomic<float> detectedHz { 0 }, targetHz { 0 }, correctionCents { 0 };
+        int latencySamples() const { return 0; }
+        explicit NovaTune (double) {}
+        void process (float* const*, int, int) noexcept {}
+        void setParams (const json::Value&) {}
+        json::Value params() const { return json::Value::object(); }
+    };
+}
+#endif
 #include "SharedAudio.h"
 #include "VstInstance.h"
 #include "Guard.h"
@@ -90,6 +111,21 @@ namespace nova::audio
                 {
                     in.name = "gain";
                     in.gain = dbToGain (ji["db"].asDouble (0.0));
+                }
+                else if (type == "novatune")
+                {
+#if ! NOVA_AUDIO_WITH_NOVATUNE
+                    err = "Nova Tune natif : seulement dans le mode audio pro Nova";
+                    return nullptr;
+#endif
+                    // Nova Tune natif (choix C2) : aucun fichier à charger, réglages de la version web.
+                    in.name = "novatune";
+                    in.id = ji["id"].asString ("novatune");
+                    in.tune = std::make_unique<NovaTune> (sampleRate);
+                    in.tune->setParams (ji["params"]);
+                    in.latency = in.tune->latencySamples();
+                    ri.set ("id", in.id);
+                    ri.set ("params", in.tune->params());
                 }
                 else
                 {
@@ -173,6 +209,7 @@ namespace nova::audio
                 }
                 if (in.vst) width = in.channels;
                 else in.channels = width;
+                if (in.id.empty()) in.id = std::to_string (k);
                 s.latency += in.latency;
                 ri.set ("name", in.name);
                 ri.set ("channels", in.channels);
@@ -220,6 +257,18 @@ namespace nova::audio
             int w = s.width;
             for (auto& ins : s.inserts)
             {
+                if (ins.tune)
+                {
+                    // Nova Tune natif : en place, somme mono -> les w canaux de la tranche.
+                    const int64_t t0 = qpcNs();
+                    ins.tune->process (a, w, frames);
+                    const int64_t dt = qpcNs() - t0;
+                    ins.st->calls.fetch_add (1, std::memory_order_relaxed);
+                    ins.st->totalNs.fetch_add ((uint64_t) dt, std::memory_order_relaxed);
+                    ins.st->lastNs.store ((uint64_t) dt, std::memory_order_relaxed);
+                    if ((uint64_t) dt > ins.st->maxNs.load (std::memory_order_relaxed)) ins.st->maxNs.store ((uint64_t) dt, std::memory_order_relaxed);
+                    continue;
+                }
                 if (! ins.vst)
                 {
                     for (int c = 0; c < w; ++c)
@@ -288,8 +337,59 @@ namespace nova::audio
                 o.set ("avg_us", calls ? (double) i.st->totalNs.load() / (double) calls / 1000.0 : 0.0);
                 o.set ("max_us", (double) i.st->maxNs.load() / 1000.0);
                 o.set ("failed", i.st->failed.load());
+                if (i.tune)
+                {
+                    o.set ("id", i.id);
+                    o.set ("detected_hz", (double) i.tune->detectedHz.load());
+                    o.set ("target_hz", (double) i.tune->targetHz.load());
+                    o.set ("correction_cents", (double) i.tune->correctionCents.load());
+                    o.set ("params", i.tune->params());
+                }
                 arr.push (o);
             }
         return arr;
+    }
+
+    void MonitorChain::updateLatency()
+    {
+        maxLatency = 0;
+        for (auto& s : strips)
+        {
+            s.latency = 0;
+            for (auto& i : s.inserts)
+            {
+                if (i.tune) i.latency = i.tune->latencySamples();
+                s.latency += i.latency;
+            }
+            maxLatency = std::max (maxLatency, s.latency);
+        }
+    }
+
+    bool MonitorChain::setInsertParams (const std::string& strip, const Value& insert, const Value& params, Value& report, std::string& err)
+    {
+        for (auto& s : strips)
+        {
+            if (s.id != strip) continue;
+            for (size_t k = 0; k < s.inserts.size(); ++k)
+            {
+                auto& in = s.inserts[k];
+                const bool match = insert.isNumber() ? (size_t) insert.asInt (-1) == k : in.id == insert.asString ("novatune");
+                if (! match) continue;
+                if (! in.tune) { err = "l'insert « " + in.id + " » n'est pas un Nova Tune"; return false; }
+                in.tune->setParams (params);   // atomiques : pris en compte au bloc suivant, sans coupure
+                updateLatency();
+                report = Value::object();
+                report.set ("strip", s.id);
+                report.set ("id", in.id);
+                report.set ("latency", in.latency);
+                report.set ("chain_latency", maxLatency);
+                report.set ("params", in.tune->params());
+                return true;
+            }
+            err = "insert introuvable dans la tranche « " + strip + " »";
+            return false;
+        }
+        err = "tranche « " + strip + " » introuvable";
+        return false;
     }
 }

@@ -18,6 +18,7 @@
       stop | stats | rec_status
       routes      enabled, routes:[{in, out, gain}]           retour direct (sans effet)
       monitor_chain  strips:[…] | clear:true                  retour avec effets (MonitorChain.h)
+      monitor_params strip, insert?, params:{…}               réglages d'un Nova Tune natif (NovaTune.h)
       measure_latency  outs:[…], seconds?, amp?               → delays:[par entrée], sample_rate
       rec_start   take_id, files:[{path, track_id, inputs, mode}], preroll?, start_frame?
                                              → start_frame, sample_rate
@@ -31,7 +32,9 @@
     Mode --ipc-echo <nom> : processus écho du banc bench_ipc (interne).
 
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -45,6 +48,9 @@
 #include "Guard.h"
 
 #include <avrt.h>
+#if NOVA_AUDIO_PRO
+ #include "pro/ProCalibrate.h"
+#endif
 
 #include <algorithm>
 #include <deque>
@@ -70,6 +76,52 @@ namespace
     const char* kVersion = "0.1.0";
     // Version du protocole (native-audio/PROTOCOLE.md) : augmentée à chaque changement incompatible.
     constexpr int kProtocol = 1;
+    // Ajouts compatibles du protocole (un client plus ancien les ignore) : « novatune » = insert Nova Tune
+    // natif dans monitor_chain et commande monitor_params (30/10/2026).
+    Value features()
+    {
+        auto f = Value::array();
+        f.push ("monitor_chain");
+#if NOVA_AUDIO_WITH_NOVATUNE
+        f.push ("novatune");
+        f.push ("monitor_params");
+#endif
+#if NOVA_AUDIO_PRO
+        // Mode audio pro Nova (30/10/2026) : périphérique « pro », assistant, reprise automatique,
+        // agrégation de deux cartes, latence mesurée.
+        f.push ("pro_audio");
+        f.push ("pro_calibrate");
+        f.push ("device_recovery");
+        f.push ("aggregate");
+        f.push ("measured_latency");
+#endif
+        return f;
+    }
+
+    // Édition du moteur : « pro » (Nova Pro Audio, propriétaire, sans pilote tiers), « asio » (GPLv3,
+    // avec le SDK de Steinberg, sans Nova Tune), « libre » (GPLv3 sans ASIO, essais).
+    const char* edition()
+    {
+#if NOVA_AUDIO_PRO
+        return "pro";
+#elif NOVA_AUDIO_WITH_ASIO
+        return "asio";
+#else
+        return "libre";
+#endif
+    }
+
+    void setDriverFlag (Value& o)
+    {
+        o.set ("edition", edition());
+#if NOVA_AUDIO_WITH_ASIO
+        o.set ("asio", true);
+#elif ! NOVA_AUDIO_PRO
+        o.set ("asio", false);
+#else
+        (void) o;
+#endif
+    }
 
     HWND msgWindow = nullptr;
     std::mutex queueLock;
@@ -231,6 +283,8 @@ namespace
         c.outChannels = m["out_channels"].asInt (0);
         c.captureSeconds = m["capture_seconds"].asDouble (12.0);
         c.playMinBlocks = m["play_min_blocks"].asInt (2);
+        c.measuredRoundtrip = std::max (0, m["measured_roundtrip"].asInt (0));
+        c.stress = std::max (0.0, std::min (0.9, m["stress"].asDouble (0.0)));
         return c;
     }
 
@@ -248,11 +302,8 @@ namespace
                 auto o = Value::object();
                 o.set ("version", kVersion);
                 o.set ("protocol", kProtocol);
-#if NOVA_AUDIO_WITH_ASIO
-                o.set ("asio", true);
-#else
-                o.set ("asio", false);
-#endif
+                o.set ("features", features());
+                setDriverFlag (o);
                 reply (id, o);
             }
             else if (cmd == "devices") reply (id, listDevices (m["wasapi"].asBool (false)));
@@ -283,6 +334,14 @@ namespace
                 Value rep;
                 std::string err;
                 if (engine->setMonitorChain (m, rep, err)) reply (id, rep);
+                else replyErr (id, err);
+            }
+            else if (cmd == "monitor_params")
+            {
+                // Réglages d'un Nova Tune natif de la chaîne, sans la reconstruire (PROTOCOLE.md § 2.3).
+                Value rep;
+                std::string err;
+                if (engine->setMonitorParams (m, rep, err)) reply (id, rep);
                 else replyErr (id, err);
             }
             else if (cmd == "measure_latency")
@@ -319,10 +378,42 @@ namespace
 #if NOVA_AUDIO_WITH_ASIO
                 if (engine->device() && asioControlPanel (engine->device())) reply (id, Value::object());
                 else replyErr (id, "panneau du pilote indisponible");
+#elif NOVA_AUDIO_PRO
+                replyErr (id, "panneau du pilote indisponible");
 #else
                 replyErr (id, "ASIO non compilé");
 #endif
             }
+#if NOVA_AUDIO_PRO
+            else if (cmd == "pro_calibrate")
+            {
+                // Assistant du mode pro : tampon le plus petit sans coupure + marge, latence mesurée.
+                // Le flux en cours est arrêté pendant l'essai, puis rouvert avec le réglage choisi.
+                if (engine->recStatus().size() > 0) { replyErr (id, "prise en cours : assistant refusé"); return; }
+                EngineConfig base = engine->isRunning() ? engine->config() : configFrom (m);
+                if (m.has ("device")) base.device = m["device"].asString (base.device);
+                if (m.has ("project_rate")) base.projectRate = m["project_rate"].asInt (base.projectRate);
+                const bool apply = m["apply"].asBool (true);
+                engine->stop();
+                std::thread ([id, m, base, apply] {
+                    auto res = pro::calibrate (m, base);
+                    post ([id, res, base, apply] () mutable {
+                        if (apply && res.has ("chosen"))
+                        {
+                            EngineConfig c = base;
+                            c.buffer = res["chosen"].asInt (base.buffer);
+                            c.measuredRoundtrip = res["measured_roundtrip"].isNumber() ? res["measured_roundtrip"].asInt (0) : 0;
+                            c.stress = 0;
+                            Value r;
+                            std::string err;
+                            if (engine->start (c, r, err)) res.set ("restarted", r);
+                            else res.set ("restart_error", err);
+                        }
+                        reply (id, res);
+                    });
+                }).detach();
+            }
+#endif
             else if (cmd == "bench_ipc")
             {
                 const double s = m["seconds"].asDouble (10.0);
@@ -414,11 +505,8 @@ int WINAPI wWinMain (HINSTANCE, HINSTANCE, PWSTR cmdLine, int)
     auto o = Value::object();
     o.set ("version", kVersion);
     o.set ("protocol", kProtocol);
-#if NOVA_AUDIO_WITH_ASIO
-    o.set ("asio", true);
-#else
-    o.set ("asio", false);
-#endif
+    o.set ("features", features());
+    setDriverFlag (o);
     o.set ("pid", (double) GetCurrentProcessId());
     io::event ("ready", o);
 

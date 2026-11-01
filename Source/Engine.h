@@ -17,7 +17,9 @@
     calée). Si la carte tourne à la fréquence du projet, c'est exactement le n° d'image de la carte.
 
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -56,6 +58,10 @@ namespace nova::audio
         double captureSeconds = 12.0;  // historique de l'anneau « projet » (pré-capture + retard d'écriture)
         int playMinBlocks = 2;
         bool shared = true;            // zone partagée avec le pont (faux : tests C++)
+        // Aller-retour MESURÉ (images de la carte, pour ce tampon), 0 = annoncé par le pilote. Les
+        // latences publiées (start, stats, mémoire partagée) en découlent : compensation exacte des prises.
+        int measuredRoundtrip = 0;
+        double stress = 0;             // part de la période brûlée dans le rappel (banc / assistant)
     };
 
     struct Route { int in = 0, out = 0; float gain = 1.0f; };
@@ -79,6 +85,9 @@ namespace nova::audio
         bool setMonitorChain (const json::Value& spec, json::Value& report, std::string& err);
         void clearMonitorChain();
         int monitorLatency() const;
+        // Réglages d'un insert « novatune » de la chaîne (commande monitor_params) : appliqués sans
+        // reconstruire la chaîne, et rejoués si le flux est rouvert (changement de tampon du pilote).
+        bool setMonitorParams (const json::Value& m, json::Value& report, std::string& err);
 
         // Mesure par impulsion : sorties outs, toutes les entrées enregistrées ; done (fil de capture).
         bool measureLatency (const std::vector<int>& outs, double seconds, float amp,
@@ -93,6 +102,10 @@ namespace nova::audio
         // Fil principal, ~10 fois par seconde : pilote qui demande une remise à zéro, chaînes à libérer.
         // Rend un événement à signaler au pont (vide sinon).
         json::Value housekeeping();
+        bool isRecovering() const { return recovering; }
+        const EngineConfig& config() const { return cfg; }
+        int reportedInputLatency() const { return repIn; }
+        int reportedOutputLatency() const { return repOut; }
 
         // Fil audio.
         void audioBlock (const float* const* in, int numIn, float* const* out, int numOut, int frames, const BlockTime& t) noexcept override;
@@ -155,6 +168,12 @@ namespace nova::audio
         int64_t projectFrameOf (int64_t deviceFrame) const;
 
         EngineConfig cfg;
+        int repIn = 0, repOut = 0;             // latences publiées (mesurées si cfg.measuredRoundtrip)
+        // Reprise automatique (carte débranchée, veille, périphérique par défaut changé).
+        bool recovering = false;
+        double nextRetryMs = 0;
+        int retries = 0;
+        uint64_t recoveries = 0;
         std::unique_ptr<AudioDevice> dev;
         std::atomic<bool> running { false };
         int devRate = 48000, projRate = 48000, block = 128, nIn = 0, nOut = 0;
@@ -189,6 +208,7 @@ namespace nova::audio
         std::atomic<bool> routesEnabled { false };
         std::atomic<MonitorChain*> chain { nullptr };
         json::Value chainSpec;
+        std::vector<json::Value> chainPatches;   // monitor_params reçus depuis le dernier monitor_chain
         struct Retired { int64_t afterCallback; std::unique_ptr<MonitorChain> chain; std::unique_ptr<RouteSet> routes; };
         std::vector<Retired> retired;
         std::unique_ptr<RouteSet> routesOwned;

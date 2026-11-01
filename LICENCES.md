@@ -6,6 +6,12 @@ Nova Studio le lance et lui parle par un protocole documenté (`PROTOCOLE.md` : 
 l'entrée et la sortie standard, échantillons audio dans une mémoire partagée). Le reste de Nova
 Studio n'est pas couvert par cette licence et reste un logiciel propriétaire de Make Music.
 
+> **Éditions.** Ce fichier couvre `NovaAudioEngine.exe` (éditions « asio » et « libre »). Le moteur
+> « Nova Pro Audio » (`NovaProAudio.exe`, dossier `pro-audio`, mode audio pro Nova et Nova Tune natif)
+> est un AUTRE programme, propriétaire de Make Music, livré avec sa propre licence
+> (`LICENCE-NOVA-PRO.txt`) : il ne contient aucun code du SDK ASIO et n'est pas couvert par la GPLv3.
+> Nova Tune natif ne fait partie d'aucune édition GPLv3.
+
 ## Licence du moteur : GNU GPL version 3
 
 Copyright (C) 2026 Make Music.

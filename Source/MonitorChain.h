@@ -18,10 +18,18 @@
     Spécification JSON (commande monitor_chain) :
       { strips: [ { id, inputs: [0] | [0, 1], gain_db, sends: [ { outs: [2, 3], gain } ],
                    inserts: [ { type: "vst3", path, class?, cid?, state?: {component, controller} }
-                              | { type: "gain", db } ] } ] }
+                              | { type: "gain", db }
+                              | { type: "novatune", id?, params?: { speed, mix, humanize, rootKey, scale, isEnabled,
+                                  lowLatency, flex, vibrato, formant, transpose, voiceType, targetNotes, chord } } ] } ] }
+
+    Insert « novatune » (choix C2, 30/10/2026) : Nova Tune porté en C++ (NovaTune.h), mêmes réglages
+    que la version web ; mode direct (lowLatency, défaut ici) = 0,5 ms + au plus une période.
+    Réglage en direct sans reconstruire la chaîne : setInsertParams (commande monitor_params).
 
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -47,6 +55,8 @@ namespace nova
 
 namespace nova::audio
 {
+    class NovaTune;
+
     struct InsertStats
     {
         std::atomic<uint64_t> calls { 0 }, totalNs { 0 }, maxNs { 0 }, lastNs { 0 };
@@ -66,6 +76,9 @@ namespace nova::audio
         static void postToMainThread (std::function<void()> fn);
         json::Value stats() const;
         bool anyFailed() const;
+        /** Fil principal : réglages d'un insert « novatune » (tranche `strip`, insert = id ou n°), sans coupure. */
+        bool setInsertParams (const std::string& strip, const json::Value& insert, const json::Value& params,
+                              json::Value& report, std::string& err);
 
     private:
         struct Insert
@@ -73,6 +86,8 @@ namespace nova::audio
             std::string name;
             float gain = 1.0f;                       // insert « gain »
             std::unique_ptr<VstInstance> vst;
+            std::unique_ptr<NovaTune> tune;           // insert « novatune »
+            std::string id;
             int latency = 0;
             int channels = 1;                         // largeur en sortie de l'insert
             std::unique_ptr<InsertStats> st;
@@ -90,6 +105,7 @@ namespace nova::audio
             std::vector<float> a, t;                  // [2][maxBlock] : travail, copie d'entrée des inserts
             int latency = 0;
         };
+        void updateLatency();
         std::vector<Strip> strips;
         int maxBlock = 0;
         int maxLatency = 0;

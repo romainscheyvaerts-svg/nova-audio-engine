@@ -14,7 +14,9 @@
       null?speed=1&input=silence|noise     nul cadencé (speed 1 = temps réel, 4 = 4× plus vite, 0 = au plus vite)
 
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -31,6 +33,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+struct IMMDeviceEnumerator;   // mmdeviceapi.h (mode audio pro)
 
 namespace nova::audio
 {
@@ -78,6 +82,8 @@ namespace nova::audio
         kEvOverload = 16,
         kEvEnded = 32,         // fin du fichier d'entrée (périphérique « file »)
         kEvError = 64,
+        kEvLost = 128,         // périphérique débranché / invalidé (veille…) : le moteur rouvre dès qu'il revient
+        kEvDefaultChanged = 256, // le périphérique par défaut de Windows a changé (flux qui le suit : rouvert)
     };
 
     class AudioDevice
@@ -118,6 +124,16 @@ namespace nova::audio
     json::Value listAsioDrivers();
 #endif
     json::Value listWasapiEndpoints();
+#if NOVA_AUDIO_PRO
+    // Mode audio pro Nova (Source/pro/, propriétaire) : WASAPI exclusif / partagé faible latence, agrégation.
+    std::unique_ptr<AudioDevice> createProDevice (const DeviceSpec& s);
+    json::Value listProEndpoints();
+    // Tests : faux énumérateur (aucun vrai périphérique) ; nullptr = celui de Windows.
+    void setProEnumeratorFactory (HRESULT (*make) (::IMMDeviceEnumerator**));
+    // Vrai dans les fils temps réel du mode pro (boucles de rendu / capture) : les tests vérifient
+    // qu'aucune allocation n'y a lieu.
+    bool inProRealtimeThread();
+#endif
     json::Value listDevices (bool wasapi);
 
     // Fil temps réel : tâche MMCSS « Pro Audio » (une fois par fil) ; repli : priorité critique.

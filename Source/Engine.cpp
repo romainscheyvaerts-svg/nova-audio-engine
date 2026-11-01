@@ -1,7 +1,9 @@
 /*
     NovaAudioEngine — le moteur (voir Engine.h).
     Copyright (C) 2026 Make Music.
-    SPDX-License-Identifier: GPL-3.0-only
+    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-MakeMusic-NovaPro
+    (Make Music, seul auteur, publie ce fichier sous GPLv3 dans les éditions asio / libre du moteur et
+    sous sa propre licence dans l'édition « Nova Pro Audio » : native-audio/pro/LICENCE.md.)
     Ce fichier fait partie de NovaAudioEngine, logiciel libre : vous pouvez le redistribuer et/ou le
     modifier selon les termes de la GNU General Public License version 3, publiée par la Free Software
     Foundation, avec la permission supplémentaire (article 7) décrite dans native-audio/LICENCES.md
@@ -25,6 +27,11 @@ namespace nova::audio
         double qpcFreq() { static const double f = [] { LARGE_INTEGER x; QueryPerformanceFrequency (&x); return (double) x.QuadPart; }(); return f; }
         constexpr int kCaptureChunk = 4096;
         constexpr int kWriterChunk = 8192;
+#if NOVA_AUDIO_PRO && ! NOVA_AUDIO_WITH_ASIO
+        constexpr const char* kDriverLossKind = "carte";
+#else
+        constexpr const char* kDriverLossKind = "asio";   // nom historique, relu tel quel par le pont
+#endif
         std::atomic<int> gShmCounter { 0 };
 
         void atomicMax (std::atomic<uint64_t>& a, uint64_t v)
@@ -275,8 +282,17 @@ namespace nova::audio
         hdr->blockFrames = (uint32_t) block;
         hdr->inChannels = (uint32_t) nIn;
         hdr->outChannels = (uint32_t) nOut;
-        hdr->inputLatency = inf.inputLatency;
-        hdr->outputLatency = inf.outputLatency;
+        repOut = inf.outputLatency;
+        repIn = inf.inputLatency;
+        if (cfg.measuredRoundtrip > 0)
+        {
+            // Compensation exacte : l'aller-retour mesuré remplace l'annoncé ; l'écart va à l'entrée
+            // (c'est elle qui décale les prises), la sortie reste celle du pilote.
+            repIn = std::max (0, cfg.measuredRoundtrip - repOut);
+            if (repIn == 0) { repIn = cfg.measuredRoundtrip / 2; repOut = cfg.measuredRoundtrip - repIn; }
+        }
+        hdr->inputLatency = repIn;
+        hdr->outputLatency = repOut;
         hdr->playLookahead = resampling ? playRs.lookahead() : 0;
         hdr->playTargetBlocks = playTarget;
         hdr->playMinBlocks = playTarget;
@@ -287,7 +303,9 @@ namespace nova::audio
         {
             Value rep;
             std::string e2;
+            auto patches = chainPatches;           // réglages Nova Tune reçus depuis : rejoués
             setMonitorChain (chainSpec, rep, e2);
+            for (auto& m : patches) setMonitorParams (m, rep, e2);
         }
 
         quitThreads = false;
@@ -321,14 +339,17 @@ namespace nova::audio
             r.set ("passband_hz", capRs.passbandHz());
             result.set ("resampler", r);
         }
-        result.set ("input_latency", inf.inputLatency);
-        result.set ("output_latency", inf.outputLatency);
-        result.set ("roundtrip_ms", 1000.0 * (inf.inputLatency + inf.outputLatency) / (double) devRate);
+        result.set ("input_latency", repIn);
+        result.set ("output_latency", repOut);
+        result.set ("roundtrip_ms", 1000.0 * (repIn + repOut) / (double) devRate);
+        result.set ("announced_roundtrip_ms", 1000.0 * (inf.inputLatency + inf.outputLatency) / (double) devRate);
+        result.set ("latency_source", cfg.measuredRoundtrip > 0 ? "measured" : "announced");
         return true;
     }
 
     void Engine::stop()
     {
+        recovering = false;         // arrêt demandé (ou réouverture) : plus de reprise en attente
         if (dev)
         {
             dev->stop();
@@ -384,10 +405,11 @@ namespace nova::audio
 
     bool Engine::setMonitorChain (const Value& spec, Value& report, std::string& err)
     {
-        if (! running && ! dev) { chainSpec = spec; report = Value::object(); report.set ("pending", true); return true; }
+        if (! running && ! dev) { chainSpec = spec; chainPatches.clear(); report = Value::object(); report.set ("pending", true); return true; }
         auto c = MonitorChain::build (spec, (double) devRate, block, report, err);
         if (! c) return false;
         chainSpec = spec;
+        chainPatches.clear();
         auto* old = chain.exchange (c.get(), std::memory_order_acq_rel);
         if (hdr) hdr->monitorLatency = (uint32_t) c->latency();
         Retired ret;
@@ -401,6 +423,7 @@ namespace nova::audio
     void Engine::clearMonitorChain()
     {
         chainSpec = Value();
+        chainPatches.clear();
         auto* old = chain.exchange (nullptr, std::memory_order_acq_rel);
         if (hdr) hdr->monitorLatency = 0;
         if (old != nullptr && chainOwned.get() == old)
@@ -410,6 +433,31 @@ namespace nova::audio
             ret.chain = std::move (chainOwned);
             retired.push_back (std::move (ret));
         }
+    }
+
+    bool Engine::setMonitorParams (const Value& m, Value& report, std::string& err)
+    {
+        const auto strip = m["strip"].asString();
+        const auto& insert = m.has ("insert") ? m["insert"] : Value ("novatune");
+        if (! chainOwned)
+        {
+            if (! chainSpec.isObject()) { err = "aucune chaîne de retour"; return false; }
+            chainPatches.push_back (m);          // chaîne en attente du démarrage : appliqué à sa construction
+            report = Value::object();
+            report.set ("pending", true);
+            return true;
+        }
+        if (! chainOwned->setInsertParams (strip, insert, m["params"], report, err)) return false;
+        // Mémorisé sous sa forme complète (réglages effectifs) : un seul par insert, la liste reste courte.
+        auto full = Value::object();
+        full.set ("strip", strip);
+        full.set ("insert", report["id"]);
+        full.set ("params", report["params"]);
+        chainPatches.erase (std::remove_if (chainPatches.begin(), chainPatches.end(), [&] (const Value& v)
+            { return v["strip"].asString() == strip && v["insert"].asString() == report["id"].asString(); }), chainPatches.end());
+        chainPatches.push_back (full);
+        if (hdr) hdr->monitorLatency = (uint32_t) chainOwned->latency();
+        return true;
     }
 
     int Engine::monitorLatency() const
@@ -423,9 +471,47 @@ namespace nova::audio
         const int64_t cbs = hdr ? (int64_t) hdr->callbacks.load() : 0;
         const bool flowing = running && dev && cbs > 0;
         retired.erase (std::remove_if (retired.begin(), retired.end(), [&] (const Retired& r) { return ! flowing || cbs >= r.afterCallback; }), retired.end());
+        if (recovering)
+        {
+            // Carte partie (débranchée, veille…) : on réessaie toutes les 0,5 s (puis 2 s), sans
+            // redémarrer Nova ; dès qu'elle revient, le flux repart avec les mêmes réglages.
+            if (nowMs() < nextRetryMs) return Value();
+            Value res;
+            std::string err;
+            const auto c = cfg;
+            ++retries;
+            if (start (c, res, err))
+            {
+                recovering = false;
+                ++recoveries;
+                auto o = Value::object();
+                o.set ("recovered", true);
+                o.set ("attempts", retries);
+                o.set ("restarted", res);
+                retries = 0;
+                return o;
+            }
+            cfg = c;
+            recovering = true;
+            nextRetryMs = nowMs() + (retries < 20 ? 500.0 : 2000.0);
+            return Value();
+        }
         if (! dev) return Value();
         const uint32_t ev = dev->events.exchange (0);
         if (ev == 0) return Value();
+        if (ev & kEvLost)
+        {
+            auto o = Value::object();
+            o.set ("lost", true);
+            o.set ("recovering", true);
+            const auto c = cfg;
+            stop();                 // prises en cours fermées proprement (fichiers lisibles)
+            cfg = c;
+            recovering = true;
+            retries = 0;
+            nextRetryMs = nowMs() + 300.0;
+            return o;
+        }
         auto o = Value::object();
         if (ev & kEvEnded) o.set ("ended", true);
         if (ev & kEvReset) o.set ("reset", true);
@@ -433,7 +519,8 @@ namespace nova::audio
         if (ev & kEvLatency) o.set ("latency_changed", true);
         if (ev & kEvOverload) o.set ("overload", true);
         if (ev & kEvError) o.set ("error", true);
-        if (ev & (kEvReset | kEvLatency))
+        if (ev & kEvDefaultChanged) o.set ("default_changed", true);
+        if (ev & (kEvReset | kEvLatency | kEvDefaultChanged))
         {
             // Le pilote demande une réinitialisation (tampon ou fréquence changés dans son panneau,
             // horloge…) ou annonce d'autres latences : comme tout hôte ASIO, on rouvre le flux avec
@@ -443,7 +530,15 @@ namespace nova::audio
             std::string err;
             const auto c = cfg;
             if (start (c, res, err)) o.set ("restarted", res);
-            else o.set ("restart_error", err);
+            else
+            {
+                o.set ("restart_error", err);
+                cfg = c;
+                recovering = true;          // on réessaiera tout seul
+                retries = 0;
+                nextRetryMs = nowMs() + 500.0;
+                o.set ("recovering", true);
+            }
         }
         return o;
     }
@@ -526,7 +621,7 @@ namespace nova::audio
                 devRing.writeSilence (n);
                 left -= n;
             }
-            lossQueue.push ({ at, std::min<int64_t> (t.lostBefore, devRing.capacity() / 2), "asio" });
+            lossQueue.push ({ at, std::min<int64_t> (t.lostBefore, devRing.capacity() / 2), kDriverLossKind });
             hdr->deviceLostFrames.fetch_add ((uint64_t) t.lostBefore, std::memory_order_relaxed);
         }
 
@@ -548,6 +643,15 @@ namespace nova::audio
 
         if (auto* c = chain.load (std::memory_order_acquire))
             c->process (in, numIn, out, numOut, frames);
+
+        if (cfg.stress > 0)
+        {
+            // Charge de calcul simulée (banc, assistant du mode pro) : comme une séance chargée.
+            const int64_t until = t0 + (int64_t) (cfg.stress * frames / devRate * qpcFreq());
+            volatile float acc = 0;
+            while (qpcNow() < until)
+                for (int i = 0; i < 64; ++i) acc = acc * 0.999f + (float) i;
+        }
 
         // Impulsion de mesure.
         if (probe.state.load (std::memory_order_acquire) == 1)
@@ -944,6 +1048,8 @@ namespace nova::audio
     {
         auto o = Value::object();
         o.set ("running", running.load());
+        o.set ("recovering", recovering);
+        o.set ("recoveries", (double) recoveries);
         if (! hdr || ! dev) return o;
         const auto& inf = dev->info();
         const double cbs = (double) hdr->callbacks.load();
@@ -955,8 +1061,9 @@ namespace nova::audio
         o.set ("in_channels", nIn);
         o.set ("out_channels", nOut);
         o.set ("resampling", resampling);
-        o.set ("input_latency", inf.inputLatency);
-        o.set ("output_latency", inf.outputLatency);
+        o.set ("input_latency", repIn);
+        o.set ("output_latency", repOut);
+        o.set ("latency_source", cfg.measuredRoundtrip > 0 ? "measured" : "announced");
         o.set ("callbacks", cbs);
         o.set ("device_frames", (double) hdr->deviceFrames.load());
         o.set ("late_callbacks", (double) hdr->lateCallbacks.load());
