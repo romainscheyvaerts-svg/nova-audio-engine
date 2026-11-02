@@ -49,6 +49,7 @@ namespace nova::audio
         auto r = Value::array();
         for (double x : rates) r.push (x);
         o.set ("rates", r);
+        if (! warning.empty()) o.set ("warning", warning);
         return o;
     }
 

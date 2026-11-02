@@ -70,6 +70,7 @@ namespace nova::audio
         bool outputReady = false;
         std::vector<std::string> inNames, outNames;
         std::vector<double> rates;                    // fréquences acceptées parmi 44,1 / 48 / 88,2 / 96 kHz
+        std::string warning;                          // à montrer à l'utilisateur (ex. entrée indisponible), vide sinon
         json::Value toJson() const;
     };
 

@@ -78,7 +78,8 @@ ne voit que `project_rate`. Réponse :
 
 - `device` : `{type, name, format, sample_rate, rates, buffer, min_buffer, max_buffer,
   preferred_buffer, granularity, in_channels, out_channels, in_names, out_names, input_latency,
-  output_latency, output_ready}` (latences en images de la carte, annoncées par le pilote) ;
+  output_latency, output_ready, warning?}` (latences en images de la carte, annoncées par le pilote ;
+  `warning` : phrase à montrer telle quelle à l'utilisateur, ex. entrée refusée à cette fréquence) ;
 - `shm` : nom de la mémoire partagée ; `layout` : décalages de tous ses champs (§ 4) ;
 - `project_rate`, `device_rate`, `buffer`, `in_channels`, `out_channels`, `resampling`,
   `resampler?`, `input_latency`, `output_latency`, `roundtrip_ms`.
@@ -204,13 +205,24 @@ les annonce, et les commandes / champs existants gardent leur sens (`monitor_cha
 - `inmap` / `outmap` : canaux de la carte pris, dans l'ordre ; `device.in_names` / `out_names` :
   « <carte> · Gauche », « <carte> · Entrée 3 »… ;
 - entrée et sortie de deux boîtiers différents (ContainerId) : **agrégation** avec correction de dérive
-  d'horloge (`drift=auto`) ; `on` la force, `off` l'interdit ; même boîtier : file directe sans latence
-  ajoutée (et si une dérive apparaît quand même, la correction s'enclenche seule) ;
+  d'horloge (`drift=auto`) ; `on` la force, `off` l'interdit ; même boîtier : file directe, sans
+  rééchantillonnage, avec un coussin d'UNE période de capture compté dans `input_latency`
+  (`input_cushion_frames`) : le paquet d'entrée d'une période tombe avec l'événement de rendu, parfois
+  juste après ; seule une avance qui grossit (vraie dérive) enclenche la correction ;
+- même boîtier dont l'entrée refuse la fréquence demandée pendant que la sortie y tourne (carte USB réglée
+  à une autre fréquence dans Windows : Scarlett Solo en 44,1 kHz, projet à 48 kHz) : les deux sens sont
+  rouverts à la fréquence de la carte (le moteur rééchantillonne vers le projet), `device.rates` ne garde
+  que celle-là et `device.warning` dit quoi régler ; si l'entrée reste impossible, la sortie tourne seule
+  et `warning` le dit (jamais d'entrée muette sans message) ;
+- période exclusive en nombre ENTIER d'images (3 ms à 44,1 kHz = 132,3 -> 133 ; `min_buffer` aussi) ;
 - `device.format` : `exclusif int24`, `partagé faible latence float32`… ; `stats.device_stats` : `mode_out`,
   `mode_in`, `format_out`, `format_in`, `period_frames`, `capture_period_frames`, `min_period_frames`,
   `default_period_frames`, `same_clock`, `aggregate`, `drift_ppm`, `fifo_level`, `fifo_target`,
   `late_wakes` (périodes perdues : réveil en retard), `render_underruns`, `capture_discontinuities`,
-  `fifo_starved`, `fifo_overflow`, `max_callback_us`, `max_wake_jitter_us`, `lost`, `exclusive_refused?` ;
+  `fifo_starved`, `fifo_overflow`, `max_callback_us`, `max_wake_jitter_us`, `lost`, `exclusive_refused?`,
+  `capture_error?`, `warning?`, `input_cushion_frames`, `slow_cadence` (fois où le pilote n'a pas tenu la
+  période : moins de réveils que le temps écoulé, au-delà de 1 % + 4 périodes ; les périodes manquantes vont
+  dans `late_wakes`), `event_interval_us` (intervalle réel moyen des événements), `period_us` ;
 - `devices` avec `wasapi: true` : `pro: [{id, name, flow, default, container, channels, mix_rate,
   channel_names, min_period_ms, default_period_ms}]` (inventaire, aucun flux ouvert), `pro_available` ;
 - pertes de la carte dans `rec_stop.losses` : `kind` = `"carte"` (au lieu de `"asio"`).
@@ -222,6 +234,10 @@ loop?: {out, in}, apply?: true}` — réponse différée (quelques secondes par 
 arrêté ; chaque taille (de la plus grande à la plus petite, défaut 1024 … 16 ; sous le minimum du
 périphérique : sautée) tourne `seconds` s dans un moteur d'essai avec une charge simulée (`stress` = part
 de la période) ; coupures = `device_xruns` + `late_callbacks` ; deux échecs de suite arrêtent la descente.
+Résultat non monotone (une taille échoue, une plus petite passe) : la taille en échec est rejouée deux fois
+plus longtemps (`replay: true` dans `trials`, `replayed` dans la réponse) et seul le rejeu compte ;
+`smallest_clean` est la dernière taille d'une suite SANS échec depuis la plus grande (jamais un tampon
+plus petit qu'une taille en échec).
 Avec `loop`, l'aller-retour est mesuré par impulsion (câble sortie `out` -> entrée `in`, ou entrée
 « boucle » de la carte). Réponse : `trials: [{requested, buffer, ok, xruns, device_xruns, late_callbacks,
 callback_avg_us, callback_max_us, cpu_percent, announced_roundtrip_ms, roundtrip_frames?, roundtrip_ms?,
